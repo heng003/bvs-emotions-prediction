@@ -1,0 +1,4 @@
+.env
+WESAD/
+__pycache__
+.dockerignore
