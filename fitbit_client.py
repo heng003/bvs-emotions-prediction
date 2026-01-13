@@ -225,11 +225,16 @@ class FitbitClient:
         return float(np.mean(values))
 
     async def fetch_last_5_min_data(self):
+        # Define Asia/Kuala_Lumpur Timezone (UTC+8)
+        KL_TZ = timezone(timedelta(hours=8))
+
         # 1. Ensure Token is Valid
         await self._refresh_token_if_needed()
         
         # 2. Setup Time Window
-        now = datetime.now()
+        # Use KL Time for querying Fitbit (API expects user local time)
+        # Robust conversion: UTC -> KL
+        now = datetime.now(timezone.utc).astimezone(KL_TZ)
         end_time = now
         start_time = now - timedelta(minutes=5)
         
@@ -271,6 +276,8 @@ class FitbitClient:
                     # Combine date_str YYYY-MM-DD + time HH:MM:SS
                     full_dt_str = f"{date_str} {t_str}"
                     t_obj = datetime.strptime(full_dt_str, "%Y-%m-%d %H:%M:%S")
+                    # Make aware (KL Time)
+                    t_obj = t_obj.replace(tzinfo=KL_TZ)
                     parsed_hr.append((t_obj, item))
                 except ValueError:
                     continue
@@ -299,12 +306,15 @@ class FitbitClient:
                     t_str = item.get('minute')
                     if not t_str: continue
                     t_obj = datetime.fromisoformat(t_str)
+                    # Make aware (KL Time) if naive
+                    if t_obj.tzinfo is None:
+                        t_obj = t_obj.replace(tzinfo=KL_TZ)
                     parsed_hrv.append((t_obj, item))
                 except ValueError:
                     continue
             
-            # HRV Fallback Limit: 30 min
-            relevant_hrv = self._filter_data_with_fallback(parsed_hrv, start_time, end_time, "HRV", fallback_limit_minutes=30)
+            # HRV Fallback Limit: 60 min
+            relevant_hrv = self._filter_data_with_fallback(parsed_hrv, start_time, end_time, "HRV", fallback_limit_minutes=60)
             final_hrv = self._process_series(relevant_hrv, 'rmssd', is_nested=True)
 
         # --- AZM ---
@@ -326,6 +336,9 @@ class FitbitClient:
                     t_str = item.get('minute')
                     if not t_str: continue
                     t_obj = datetime.fromisoformat(t_str)
+                    # Make aware (KL Time) if naive
+                    if t_obj.tzinfo is None:
+                        t_obj = t_obj.replace(tzinfo=KL_TZ)
                     parsed_azm.append((t_obj, item))
                 except ValueError:
                     continue

@@ -96,11 +96,11 @@ async def process_user_device(user: dict):
                 
                 final_timestamp = ts_obj.isoformat()
             else:
-                final_timestamp = datetime.now(KL_TZ).isoformat()
+                final_timestamp = datetime.now(timezone.utc).astimezone(KL_TZ).isoformat()
         except Exception as e:
             logger.warning(f"Timestamp parsing failed ({e}), using current KL time.")
             # Fallback to current KL time if parsing fails
-            final_timestamp = datetime.now(KL_TZ).isoformat()
+            final_timestamp = datetime.now(timezone.utc).astimezone(KL_TZ).isoformat()
 
         data_payload = {
             "user_id": user_id,
