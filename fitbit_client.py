@@ -27,9 +27,8 @@ class FitbitClient:
             self.expires_at = datetime.now(timezone.utc)
 
         # LOGGING: Print Token and Expiry for debugging
-        logger.info(f"🔹 Device {self.device_id} for User {self.user_id}")
-        logger.info(f"   Access Token: {self.access_token}")
-        logger.info(f"   Expires At:   {self.expires_at}")
+        logger.info(f"Device {self.device_id} for User {self.user_id}")
+        logger.info(f"Refresh Token Expires At: {self.expires_at}")
         
         # Load Credentials from Environment
         self.client_id = os.getenv("FITBIT_CLIENT_ID")
@@ -154,52 +153,79 @@ class FitbitClient:
             logger.error(f"Failed to parse JSON for {response.url}: {e}")
             return {}
 
-    def _process_series(self, data_points, value_key, is_nested=False):
+    def _filter_data_with_fallback(self, parsed_data, start_time, end_time, metric_name="Data", fallback_limit_minutes=5):
         """
-        Calculates metric based on user rule:
-        - If outlier exists (extreme high/low), use that value.
-        - Else, use average.
+        Generic fallback logic:
+        1. Try to find data strictly within [start_time, end_time].
+        2. If empty, find the closest data point <= end_time, BUT within limit.
+           Max acceptable age = window size (5 min) + fallback_limit
         """
-        if not data_points:
-            return 0
+        relevant_items = []
         
-        values = []
-        for point in data_points:
-            if is_nested:
-                # Handling HRV/AZM structure: value -> key
-                val_obj = point.get('value', {})
-                # Ensure val_obj is a dict before .get()
-                if isinstance(val_obj, dict):
-                    val = val_obj.get(value_key, 0)
-                else:
-                    val = val_obj # Fallback if it's a direct value
-            else:
-                val = point.get('value', 0)
-            values.append(val)
+        # 1. Strict Window
+        for t_obj, item in parsed_data:
+            if start_time <= t_obj <= end_time:
+                relevant_items.append(item)
+                
+        # 2. Fallback
+        if not relevant_items and parsed_data:
+            closest_timestamp = None
+            closest_item = None
             
+            # Allow data up to (window_duration + fallback_limit) ago from end_time
+            # window duration is implicit (start_time - end_time), but we know it's 5 mins.
+            # So start_time is (end_time - 5min). 
+            # We want to go back `fallback_limit` BEFORE start_time.
+            cutoff_time = start_time - timedelta(minutes=fallback_limit_minutes)
+
+            for t_obj, item in parsed_data:
+                # Must be before end_time AND after cutoff
+                if cutoff_time <= t_obj <= end_time:
+                    if closest_timestamp is None or t_obj > closest_timestamp:
+                        closest_timestamp = t_obj
+                        closest_item = item
+            
+            if closest_item:
+                logger.info(f"{metric_name} missing for window. Fallback to closest data at {closest_timestamp} (Limit: {fallback_limit_minutes}m)")
+                relevant_items.append(closest_item)
+            else:
+                logger.warning(f"{metric_name} missing in window AND within fallback limit ({fallback_limit_minutes}m).")
+
+        return relevant_items
+
+    def _process_series(self, data_list, value_key, is_nested=False):
+        """
+        Calculates the average of a specific metric from a list of data items.
+        Handles nested 'value' dictionaries if is_nested=True.
+        """
+        if not data_list:
+            return 0
+            
+        values = []
+        for item in data_list:
+            try:
+                if is_nested:
+                    # e.g. item['value']['rmssd']
+                    val_dict = item.get('value', {})
+                    if isinstance(val_dict, dict):
+                        val = val_dict.get(value_key)
+                        if val is not None:
+                            values.append(float(val))
+                else:
+                    # e.g. item['value']
+                    val = item.get(value_key)
+                    if val is not None:
+                        values.append(float(val))
+            except (ValueError, TypeError):
+                continue
+                
         if not values:
             return 0
             
-        np_values = np.array(values)
-        
-        # Outlier Detection Logic
-        if value_key == 'heart_rate':
-            max_val = np.max(np_values)
-            min_val = np.min(np_values)
-            if max_val > self.HR_HIGH_THRESHOLD:
-                return float(max_val)
-            if min_val < self.HR_LOW_THRESHOLD:
-                return float(min_val)
-                
-        if value_key == 'rmssd': # HRV
-            min_val = np.min(np_values)
-            if min_val < self.HRV_LOW_THRESHOLD:
-                return float(min_val)
-
-        return float(np.mean(np_values))
+        return float(np.mean(values))
 
     async def fetch_last_5_min_data(self):
-        # 1. Ensure Token is Valid (Initial check based on time)
+        # 1. Ensure Token is Valid
         await self._refresh_token_if_needed()
         
         # 2. Setup Time Window
@@ -207,64 +233,84 @@ class FitbitClient:
         end_time = now
         start_time = now - timedelta(minutes=5)
         
+        # Fetch from midnight to ensure we have previous data for fallback
+        midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        
         date_str = now.strftime("%Y-%m-%d")
-        start_time_str = start_time.strftime("%H:%M")
-        end_time_str = end_time.strftime("%H:%M")
+        
+        # API requires HH:MM for time params
+        start_request_str = midnight.strftime("%H:%M") 
+        end_request_str = end_time.strftime("%H:%M")
         
         async with httpx.AsyncClient() as client:
-            # Heart Rate
-            hr_url = f"https://api.fitbit.com/1/user/-/activities/heart/date/{date_str}/1d/1min/time/{start_time_str}/{end_time_str}.json"
+            # Heart Rate - Fetch from midnight
+            hr_url = f"https://api.fitbit.com/1/user/-/activities/heart/date/{date_str}/1d/1min/time/{start_request_str}/{end_request_str}.json"
             hr_resp = await self._get_with_retry(client, hr_url)
             
-            # HRV (Intraday requires specific handling, often whole day fetch if filtering is hard)
+            # HRV - Fetches all day by default usually
             hrv_url = f"https://api.fitbit.com/1/user/-/hrv/date/{date_str}/all.json"
             hrv_resp = await self._get_with_retry(client, hrv_url)
             
-            # Active Zone Minutes
-            azm_url = f"https://api.fitbit.com/1/user/-/activities/active-zone-minutes/date/{date_str}/1d/1min/time/{start_time_str}/{end_time_str}.json"
+            # Active Zone Minutes - Fetch from midnight
+            azm_url = f"https://api.fitbit.com/1/user/-/activities/active-zone-minutes/date/{date_str}/1d/1min/time/{start_request_str}/{end_request_str}.json"
             azm_resp = await self._get_with_retry(client, azm_url)
 
         # 4. Process Responses
-        if hr_resp.status_code != 200:
-            logger.error(f"Fitbit API Error (HR): {hr_resp.status_code} - {hr_resp.text}")
-            return None
+        # --- Heart Rate ---
+        final_hr = 0
+        if hr_resp.status_code == 200:
+            hr_json = self._safe_get_json(hr_resp)
+            hr_dataset = hr_json.get('activities-heart-intraday', {}).get('dataset', [])
             
-        # Parse HR (Standard dataset structure)
-        hr_json = self._safe_get_json(hr_resp)
-        hr_data = hr_json.get('activities-heart-intraday', {}).get('dataset', [])
-        final_hr = self._process_series(hr_data, 'value', is_nested=False)
-        
-        # Parse HRV (Nested 'minutes' list structure)
+            # Parse HR Timestamps (Time is "HH:MM:SS", need to combine with date)
+            parsed_hr = []
+            for item in hr_dataset:
+                t_str = item.get('time')
+                if not t_str: continue
+                try:
+                    # Combine date_str YYYY-MM-DD + time HH:MM:SS
+                    full_dt_str = f"{date_str} {t_str}"
+                    t_obj = datetime.strptime(full_dt_str, "%Y-%m-%d %H:%M:%S")
+                    parsed_hr.append((t_obj, item))
+                except ValueError:
+                    continue
+            
+            # HR Fallback Limit: 5 min
+            relevant_hr = self._filter_data_with_fallback(parsed_hr, start_time, end_time, "HeartRate", fallback_limit_minutes=5)
+            final_hr = self._process_series(relevant_hr, 'value', is_nested=False)
+        else:
+            logger.error(f"Fitbit API Error (HR): {hr_resp.status_code} - {hr_resp.text}")
+
+        # --- HRV ---
         final_hrv = 0
         if hrv_resp.status_code == 200:
             hrv_json_body = self._safe_get_json(hrv_resp)
             hrv_list = hrv_json_body.get('hrv', [])
             hrv_minutes = []
-            
             if isinstance(hrv_list, list):
                  for entry in hrv_list:
                      if isinstance(entry, dict) and 'minutes' in entry:
                          hrv_minutes.extend(entry['minutes'])
             
-            relevant_hrv = []
+            parsed_hrv = []
             for item in hrv_minutes:
                 if not isinstance(item, dict): continue
                 try:
                     t_str = item.get('minute')
                     if not t_str: continue
                     t_obj = datetime.fromisoformat(t_str)
-                    if start_time <= t_obj <= end_time:
-                        relevant_hrv.append(item)
+                    parsed_hrv.append((t_obj, item))
                 except ValueError:
                     continue
             
+            # HRV Fallback Limit: 30 min
+            relevant_hrv = self._filter_data_with_fallback(parsed_hrv, start_time, end_time, "HRV", fallback_limit_minutes=30)
             final_hrv = self._process_series(relevant_hrv, 'rmssd', is_nested=True)
 
-        # Parse AZM (Nested 'minutes' list structure, similar to HRV)
+        # --- AZM ---
         final_azm = 0
         if azm_resp.status_code == 200:
             azm_json_body = self._safe_get_json(azm_resp)
-            # Correct key based on user input
             azm_list = azm_json_body.get('activities-active-zone-minutes-intraday', [])
             azm_minutes = []
 
@@ -273,21 +319,25 @@ class FitbitClient:
                     if isinstance(entry, dict) and 'minutes' in entry:
                         azm_minutes.extend(entry['minutes'])
             
-            relevant_azm = []
+            parsed_azm = []
             for item in azm_minutes:
                 if not isinstance(item, dict): continue
                 try:
                     t_str = item.get('minute')
                     if not t_str: continue
                     t_obj = datetime.fromisoformat(t_str)
-                    
-                    if start_time <= t_obj <= end_time:
-                        relevant_azm.append(item)
+                    parsed_azm.append((t_obj, item))
                 except ValueError:
                     continue
             
-            # Value key is 'activeZoneMinutes' inside the nested 'value' object
+            # AZM Fallback Limit: 5 min
+            relevant_azm = self._filter_data_with_fallback(parsed_azm, start_time, end_time, "AZM", fallback_limit_minutes=5)
             final_azm = self._process_series(relevant_azm, 'activeZoneMinutes', is_nested=True)
+
+        # Check if ALL data is missing
+        if final_hr == 0 and final_hrv == 0 and final_azm == 0:
+            logger.info("No valid data found for HR, HRV, or AZM (even with fallback). skipping prediction.")
+            return None
 
         return {
             "hr": final_hr,

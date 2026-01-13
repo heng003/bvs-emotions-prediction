@@ -103,3 +103,8 @@ Troubleshooting
 Fitbit 429 Errors (Rate Limits): The system fetches 3 endpoints (HR, HRV, AZM) per user every 5 minutes. This is generally within Fitbit's standard rate limits (150 calls/hour per user), but be mindful if testing aggressively.
 
 Token Errors: Ensure the initial fitbit_access_token and fitbit_refresh_token in your Supabase devices table are valid before starting the server.
+
+
+gcloud builds submit --tag gcr.io/consummate-link-474700-p6/well-bot-bvs-emotion .
+
+gcloud run deploy well-bot-bvs-emotion --image gcr.io/consummate-link-474700-p6/well-bot-bvs-emotion --platform managed --region asia-south1 --allow-unauthenticated --no-cpu-throttling --min-instances 1

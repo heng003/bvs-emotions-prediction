@@ -1,5 +1,8 @@
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+
+# Define Asia/Kuala_Lumpur Timezone (UTC+8)
+KL_TZ = timezone(timedelta(hours=8))
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -39,9 +42,14 @@ async def process_user_device(user: dict):
             return
         
         # Log DB Extraction Success
-        logger.info(f"✅ DB: Successfully extracted device details for user {user_id}")
+        logger.info(f"DB: Successfully extracted device details for user {user_id}")
         
         device = device_response.data[0]
+        
+        # Check if device is active
+        if device.get('status') != 'active':
+            logger.info(f"Device {device_id} for user {user_id} is not active. Status: {device.get('status')}")
+            return
         
         # 2. Initialize Fitbit Client (handles token refresh automatically)
         client = FitbitClient(device, user_id)
@@ -60,7 +68,7 @@ async def process_user_device(user: dict):
             return
 
         # Log Fitbit Extraction Success
-        logger.info(f"✅ Fitbit: Successfully extracted data for user {user_id}: {sensor_data}")
+        logger.info(f"Fitbit: Successfully extracted data for user {user_id}: {sensor_data}")
 
         # 4. Predict Emotion
         # Input format: [HeartRate, HRV, ActiveZoneMinutes]
@@ -73,21 +81,26 @@ async def process_user_device(user: dict):
         prediction = predictor.predict(features)
         
         # 5. Save Result
-        # Ensure timestamp is in valid timestamptz format (UTC)
+        # Ensure timestamp is saved with Asia/Kuala_Lumpur timezone (UTC+8)
         try:
             # Parse the timestamp string
             ts_str = sensor_data.get('timestamp')
             if ts_str:
                 ts_obj = datetime.fromisoformat(ts_str)
-                # If naive (no timezone), force UTC
+                # If naive (no timezone), assume it was generated in KL time (local execution)
                 if ts_obj.tzinfo is None:
-                    ts_obj = ts_obj.replace(tzinfo=timezone.utc)
+                    ts_obj = ts_obj.replace(tzinfo=KL_TZ)
+                else:
+                    # If it has a timezone, convert to KL
+                    ts_obj = ts_obj.astimezone(KL_TZ)
+                
                 final_timestamp = ts_obj.isoformat()
             else:
-                final_timestamp = datetime.now(timezone.utc).isoformat()
-        except Exception:
-            # Fallback to current UTC time if parsing fails
-            final_timestamp = datetime.now(timezone.utc).isoformat()
+                final_timestamp = datetime.now(KL_TZ).isoformat()
+        except Exception as e:
+            logger.warning(f"Timestamp parsing failed ({e}), using current KL time.")
+            # Fallback to current KL time if parsing fails
+            final_timestamp = datetime.now(KL_TZ).isoformat()
 
         data_payload = {
             "user_id": user_id,
@@ -116,7 +129,7 @@ async def scheduled_job():
         users = response.data
         
         # Log DB User Extraction
-        logger.info(f"✅ DB: Extracted {len(users) if users else 0} active users.")
+        logger.info(f"DB: Extracted {len(users) if users else 0} active users.")
 
         if not users:
             logger.info("No active users with devices found.")
@@ -127,7 +140,7 @@ async def scheduled_job():
             await process_user_device(user)
             
     except Exception as e:
-        logger.error(f"❌ DB Error during user fetch: {e}")
+        logger.error(f"DB Error during user fetch: {e}")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -135,13 +148,13 @@ async def lifespan(app: FastAPI):
     try:
         # Simple query to check connectivity
         supabase_client.table('users').select("id").limit(1).execute()
-        logger.info("✅ Database connected successfully.")
+        logger.info("Database connected successfully.")
     except Exception as e:
-        logger.error(f"❌ Database connection failed: {e}")
+        logger.error(f"Database connection failed: {e}")
 
     # 2. Start Scheduler
     scheduler = AsyncIOScheduler()
-    scheduler.add_job(scheduled_job, 'interval', minutes=1)
+    scheduler.add_job(scheduled_job, 'interval', minutes=5)
     scheduler.start()
     yield
     # Shutdown logic if needed
