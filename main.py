@@ -1,4 +1,5 @@
 import logging
+import uuid
 from datetime import datetime, timezone, timedelta
 
 # Define Asia/Kuala_Lumpur Timezone (UTC+8)
@@ -10,6 +11,7 @@ from pydantic import BaseModel
 from database import supabase_client
 from fitbit_client import FitbitClient
 from emotion_model import EmotionPredictor
+from status_tracker import status_tracker, router as status_router
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -31,14 +33,29 @@ async def process_user_device(user: dict):
     3. Predict Emotion
     4. Save to Supabase
     """
+    user_id = user.get('id')
+    fitbit_api_success = False
+    db_write_success = False
+    error_msg = None
+    processing_timestamp = datetime.now(timezone.utc)
+    
     try:
-        user_id = user['id']
         device_id = user['device_id']
         
         # 1. Fetch Device details
         device_response = supabase_client.table('devices').select('*').eq('id', device_id).execute()
         if not device_response.data:
             logger.warning(f"Device not found for user {user_id}")
+            error_msg = "Device not found"
+            status_tracker.log_user_processing(
+                user_id=user_id,
+                timestamp=processing_timestamp,
+                emotion="unknown",
+                confidence=0.0,
+                db_write_success=False,
+                fitbit_api_success=False,
+                error=error_msg
+            )
             return
         
         # Log DB Extraction Success
@@ -49,6 +66,16 @@ async def process_user_device(user: dict):
         # Check if device is active
         if device.get('status') != 'active':
             logger.info(f"Device {device_id} for user {user_id} is not active. Status: {device.get('status')}")
+            error_msg = f"Device not active: {device.get('status')}"
+            status_tracker.log_user_processing(
+                user_id=user_id,
+                timestamp=processing_timestamp,
+                emotion="unknown",
+                confidence=0.0,
+                db_write_success=False,
+                fitbit_api_success=False,
+                error=error_msg
+            )
             return
         
         # 2. Initialize Fitbit Client (handles token refresh automatically)
@@ -60,15 +87,36 @@ async def process_user_device(user: dict):
         
         if not sensor_data:
             logger.info(f"No recent data synced for user {user_id}")
+            error_msg = "No recent Fitbit data"
+            status_tracker.log_user_processing(
+                user_id=user_id,
+                timestamp=processing_timestamp,
+                emotion="unknown",
+                confidence=0.0,
+                db_write_success=False,
+                fitbit_api_success=False,
+                error=error_msg
+            )
             return
 
         # VALIDATION FIX: Ensure sensor_data is a dictionary (type check before .get())
         if not isinstance(sensor_data, dict):
             logger.error(f"FitbitClient returned invalid data type: {type(sensor_data)}. Expected dict. Data: {sensor_data}")
+            error_msg = "Invalid Fitbit data format"
+            status_tracker.log_user_processing(
+                user_id=user_id,
+                timestamp=processing_timestamp,
+                emotion="unknown",
+                confidence=0.0,
+                db_write_success=False,
+                fitbit_api_success=False,
+                error=error_msg
+            )
             return
 
         # Log Fitbit Extraction Success
         logger.info(f"Fitbit: Successfully extracted data for user {user_id}: {sensor_data}")
+        fitbit_api_success = True
 
         # 4. Predict Emotion
         # Input format: [HeartRate, HRV, ActiveZoneMinutes]
@@ -111,16 +159,55 @@ async def process_user_device(user: dict):
         
         supabase_client.table('bvs_emotion').insert(data_payload).execute()
         logger.info(f"Saved prediction for {user_id}: {prediction['emotion']}")
+        db_write_success = True
+        
+        # Log successful processing
+        status_tracker.log_user_processing(
+            user_id=user_id,
+            timestamp=processing_timestamp,
+            emotion=prediction['emotion'],
+            confidence=prediction['confidence'],
+            db_write_success=True,
+            fitbit_api_success=True,
+            error=None
+        )
 
     except Exception as e:
-        logger.error(f"Error processing user {user.get('id')}: {str(e)}")
+        error_msg = str(e)
+        logger.error(f"Error processing user {user_id}: {error_msg}")
+        # Log failed processing
+        status_tracker.log_user_processing(
+            user_id=user_id or "unknown",
+            timestamp=processing_timestamp,
+            emotion="unknown",
+            confidence=0.0,
+            db_write_success=False,
+            fitbit_api_success=fitbit_api_success,
+            error=error_msg
+        )
 
 async def scheduled_job():
     """
     Runs every 5 minutes.
     Fetches all active users with devices and processes them.
     """
+    job_id = str(uuid.uuid4())
+    job_start_time = datetime.now(timezone.utc)
+    users_found = 0
+    users_processed = 0
+    users_failed = 0
+    
     logger.info("Starting scheduled data fetch...")
+    
+    # Log job start
+    status_tracker.log_scheduled_job_run(
+        job_id=job_id,
+        started_at=job_start_time,
+        users_found=0,
+        users_processed=0,
+        users_failed=0,
+        status="running"
+    )
     
     try:
         # Fetch active users who have a device_id
@@ -128,19 +215,69 @@ async def scheduled_job():
         response = supabase_client.table('users').select('*').not_.is_('device_id', 'null').execute()
         users = response.data
         
+        users_found = len(users) if users else 0
+        
         # Log DB User Extraction
-        logger.info(f"DB: Extracted {len(users) if users else 0} active users.")
+        logger.info(f"DB: Extracted {users_found} active users.")
+        
+        # Update job with user count
+        status_tracker.log_scheduled_job_run(
+            job_id=job_id,
+            started_at=job_start_time,
+            users_found=users_found,
+            users_processed=0,
+            users_failed=0,
+            status="running"
+        )
 
         if not users:
             logger.info("No active users with devices found.")
+            # Log completed job with no users
+            status_tracker.log_scheduled_job_run(
+                job_id=job_id,
+                started_at=job_start_time,
+                users_found=0,
+                users_processed=0,
+                users_failed=0,
+                completed_at=datetime.now(timezone.utc),
+                status="completed"
+            )
             return
 
         # In production, you might want to use a task queue (Celery) here for parallelism
         for user in users:
-            await process_user_device(user)
+            try:
+                await process_user_device(user)
+                users_processed += 1
+            except Exception as e:
+                logger.error(f"Failed to process user {user.get('id')}: {e}")
+                users_failed += 1
+        
+        # Log job completion
+        job_end_time = datetime.now(timezone.utc)
+        status_tracker.log_scheduled_job_run(
+            job_id=job_id,
+            started_at=job_start_time,
+            users_found=users_found,
+            users_processed=users_processed,
+            users_failed=users_failed,
+            completed_at=job_end_time,
+            status="completed"
+        )
+        logger.info(f"Scheduled job completed: {users_processed} processed, {users_failed} failed out of {users_found} users")
             
     except Exception as e:
         logger.error(f"DB Error during user fetch: {e}")
+        # Log job failure
+        status_tracker.log_scheduled_job_run(
+            job_id=job_id,
+            started_at=job_start_time,
+            users_found=users_found,
+            users_processed=users_processed,
+            users_failed=users_failed,
+            completed_at=datetime.now(timezone.utc),
+            status="failed"
+        )
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -161,6 +298,9 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+# Include status tracking routes
+app.include_router(status_router)
+
 @app.get("/")
 async def root():
     return {"status": "System is running", "scheduler": "Active (5 min interval)"}
@@ -180,8 +320,20 @@ async def manual_predict(request: PredictionRequest):
     - hrv: Heart Rate Variability (ms, RMSSD)
     - azm: Active Zone Minutes (0 or 1, or minutes count)
     """
+    request_timestamp = datetime.now(timezone.utc)
     features = [request.hr, request.hrv, request.azm]
     prediction = predictor.predict(features)
+    
+    # Log manual prediction request
+    status_tracker.log_manual_predict(
+        timestamp=request_timestamp,
+        hr=request.hr,
+        hrv=request.hrv,
+        azm=request.azm,
+        emotion=prediction['emotion'],
+        confidence=prediction['confidence']
+    )
+    
     return {
         "input": {
             "hr": request.hr,
